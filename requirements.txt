@@ -4,3 +4,4 @@ openai
 sentence-transformers
 oracledb
 pypdf
+nvidia-ml-py3

@@ -10,6 +10,8 @@ from langchain_text_splitters.sentence_transformers import SentenceTransformersT
 import json
 import array
 import gc
+import pynvml
+import time
 
 # Import your RAG class (assuming it's in a file called rag_class.py)
 from nvidiaRAGclass import RAGEmbeddingReranker
@@ -282,39 +284,6 @@ def get_document_count():
         if conn:
             conn.close()
         return -1
-
-def display_answer_with_thinking(response_text):
-    """Parse and display the response with styled thinking section.
-    
-    Args:
-        response_text (str): The raw response from the LLM
-    """
-    # Check if there's a thinking section
-    if "</think>" in response_text:
-        # Split at the closing tag
-        parts = response_text.split("</think>", 1)
-        thinking_part = parts[0]
-        answer_part = parts[1].strip() if len(parts) > 1 else ""
-        
-        # Remove opening <think> tag if present
-        if "<think>" in thinking_part:
-            thinking_part = thinking_part.split("<think>", 1)[1]
-        
-        # Display thinking
-        with st.container():
-            st.info("💭 **Thinking Process**")
-            st.write(thinking_part.strip(), unsafe_allow_html=False)
-        
-        st.divider()
-        
-        # Display the actual answer
-        if answer_part:
-            st.success("✅ **Answer**")
-            st.markdown(answer_part)
-    else:
-        # No thinking section, just display the answer
-        st.success("✅ **Answer**")
-        st.markdown(response_text)
 
 
 def get_all_documents_metadata():
@@ -648,30 +617,66 @@ def add_to_db(uploaded_file):  # Single file, not list
         gc.collect()
 
 
-def run_rag_chain_with_details(query):
+def run_rag_chain_with_details(query, enable_thinking=False, 
+                                max_tokens=32000, temperature=0.3, top_p=0.95):
     """Process a query using RAG and return detailed information.
     
     Args:
         query (str): The user's question
+        enable_thinking (bool): Whether to enable thinking mode
+        max_tokens (int): Maximum total response tokens
+        temperature (float): Sampling temperature
+        top_p (float): Nucleus sampling parameter
     
     Returns:
         tuple: (answer, retrieval_info, rerank_info)
     """
-    # Step 1: Retrieve documents
-    retrieved_docs = retrieve_similar_documents(query, top_k=10)
+    # Create tabs for different views
+    result_tab, process_tab = st.tabs(["📝 Answer", "🔍 Process Details"])
     
-    if not retrieved_docs:
-        return "I couldn't find any relevant information in the database. Please add some IT documents first.", [], []
+    retrieved_docs = None
+    top_reranked = None
     
-    # Extract content for reranking
-    doc_contents = [doc[0] for doc in retrieved_docs]
-    
-    # Step 2: Rerank documents
-    with torch.no_grad():
-        rerank_results = rag_model.rerank([query], doc_contents, return_sorted=True)
-    
-    # Get top 5 reranked documents
-    top_reranked = rerank_results[:5]
+    with process_tab:
+        # Step 1: Retrieve documents
+        with st.status("🔍 Step 1: Retrieving similar documents...", expanded=False) as status1:
+            retrieved_docs = retrieve_similar_documents(query, top_k=10)
+            
+            if not retrieved_docs:
+                st.error("No relevant documents found")
+                status1.update(label="❌ No documents found", state="error")
+                return None, [], []
+            
+            st.write(f"Retrieved {len(retrieved_docs)} documents")
+            
+            with st.expander("View retrieved documents"):
+                for i, (content, metadata, similarity) in enumerate(retrieved_docs, 1):
+                    st.write(f"**{i}.** Score: `{similarity:.4f}`")
+                    st.caption(content[:200] + "...")
+                    if i < len(retrieved_docs):
+                        st.divider()
+            
+            status1.update(label="✅ Step 1: Retrieved documents", state="complete")
+        
+        # Extract content for reranking
+        doc_contents = [doc[0] for doc in retrieved_docs]
+        
+        # Step 2: Rerank documents
+        with st.status("🎯 Step 2: Reranking documents...", expanded=False) as status2:
+            with torch.no_grad():
+                rerank_results = rag_model.rerank([query], doc_contents, return_sorted=True)
+            
+            top_reranked = rerank_results[:5]
+            st.write(f"Reranked to top {len(top_reranked)} most relevant")
+            
+            with st.expander("View reranked documents"):
+                for i, (idx, score) in enumerate(top_reranked, 1):
+                    st.write(f"**{i}.** Score: `{score:.4f}` (was position {idx+1})")
+                    st.caption(doc_contents[idx][:200] + "...")
+                    if i < len(top_reranked):
+                        st.divider()
+            
+            status2.update(label="✅ Step 2: Reranked documents", state="complete")
     
     # Build context
     context_parts = []
@@ -680,14 +685,26 @@ def run_rag_chain_with_details(query):
     
     context = "\n\n---\n\n".join(context_parts)
     
-    # Step 3: Generate answer
-    try:
-        client = OpenAI(
-            api_key=st.session_state.get("openai_api_key") or os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        )
-        
-        prompt = f"""You are a highly knowledgeable IT assistant. Answer the user's question using ONLY the information provided in the context below.
+    # Generate the answer in the result tab with progress feedback
+    with result_tab:
+        # Show generation status
+        with st.status("💭 Generating answer...", expanded=True) as status3:
+            try:
+                client = OpenAI(
+                    api_key=st.session_state.get("openai_api_key") or os.getenv("OPENAI_API_KEY"),
+                    base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+                )
+                
+                # Build system message based on thinking setting
+                if enable_thinking:
+                    system_content = "You are a helpful IT assistant who provides comprehensive, detailed answers based on provided documentation. /think"
+                else:
+                    system_content = "You are a helpful IT assistant who provides comprehensive, detailed answers based on provided documentation. /no_think"
+                
+                st.write(f"🧠 Thinking: {'Enabled' if enable_thinking else 'Disabled'}")
+                st.write(f"⚙️ Temperature: {temperature} | Top-P: {top_p} | Max Tokens: {max_tokens}")
+                
+                prompt = f"""You are a highly knowledgeable IT assistant. Answer the user's question using ONLY the information provided in the context below.
 
 CONTEXT:
 {context}
@@ -707,22 +724,47 @@ INSTRUCTIONS:
 
 ANSWER:"""
 
-        response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4"),
-            messages=[
-                {"role": "system", "content": "You are a helpful IT assistant who provides comprehensive, detailed answers based on provided documentation."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.3")),
-            max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "2000"))
-        )
+                # Prepare API parameters
+                api_params = {
+                    "model": os.getenv("OPENAI_MODEL", "gpt-4"),
+                    "messages": [
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "top_p": top_p
+                }
+                
+                
+                # Show status message with spinner
+                status_msg = st.empty()
+                status_msg.info("🚀 Calling LLM API - Please wait...")
+                
+                with st.spinner("Generating response..."):
+                    response = client.chat.completions.create(**api_params)
+                
+                status_msg.success("✅ Response received!")
+                time.sleep(0.5)  # Brief pause to show success
+                status_msg.empty()  # Clear the message
+                
+                answer = response.choices[0].message.content
+                
+                status3.update(label="✅ Answer generated successfully!", state="complete")
+
+                
+            except Exception as e:
+                st.error(f"Error generating response: {e}")
+                import traceback
+                st.error(traceback.format_exc())
+                status3.update(label="❌ Error generating answer", state="error")
+                return None, retrieved_docs, top_reranked
         
-        answer = response.choices[0].message.content
+        # Display the answer below the status
+        st.divider()
+        display_answer_with_thinking(answer, enable_thinking)
         
         return answer, retrieved_docs, top_reranked
-        
-    except Exception as e:
-        return f"Error generating response: {e}", retrieved_docs, top_reranked
 
 
 def main():
@@ -822,52 +864,120 @@ def main():
                 else:
                     st.warning("No documents in database")
     
-    # ============= RIGHT SIDEBAR: System Info & Stats (COMPACT) =============
+    # ============= RIGHT SIDEBAR: Configuration & Info =============
     with right_col:
-        st.markdown("#### ℹ️ Info")
+        st.markdown("#### ⚙️ Settings")
         
-        # Database stats - compact
-        doc_count = get_document_count()
-        if doc_count >= 0:
-            st.metric("Chunks", doc_count, label_visibility="visible")
+        # LLM Configuration Parameters
+        with st.expander("🎛️ LLM Config", expanded=True):
+            # Thinking toggle
+            enable_thinking = st.checkbox(
+                "Enable Thinking",
+                value=False,
+                help="Allow the model to show its reasoning process"
+            )
+
+            
+            # Max tokens
+            max_tokens = st.number_input(
+                "Max Tokens",
+                min_value=1000,
+                max_value=64000,
+                value=32000,
+                step=1000,
+                help="Maximum response length"
+            )
+            
+            # Temperature
+            temperature = st.slider(
+                "Temperature",
+                min_value=0.0,
+                max_value=2.0,
+                value=0.3,
+                step=0.1,
+                help="Controls randomness (0=focused, 2=creative)"
+            )
+            
+            # Top P
+            top_p = st.slider(
+                "Top P",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.95,
+                step=0.05,
+                help="Nucleus sampling threshold"
+            )
         
         st.divider()
         
-        # GPU/System info - compact
+        # Database stats
+        st.markdown("##### 📊 Stats")
+        doc_count = get_document_count()
+        if doc_count >= 0:
+            st.metric("Chunks", doc_count)
+        
+        st.divider()
+        
+        # GPU/System info
+        st.markdown("##### 🖥️ System")
         if torch.cuda.is_available():
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            allocated = torch.cuda.memory_allocated(0) / (1024**3)
-            
-            st.metric("GPU", f"{allocated:.1f}GB")
-            st.progress(allocated / gpu_memory)
-            st.caption(f"of {gpu_memory:.1f}GB")
+            try:
+                # Initialize NVML
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                
+                # Get GPU name
+                gpu_name = pynvml.nvmlDeviceGetName(handle)
+                if isinstance(gpu_name, bytes):
+                    gpu_name = gpu_name.decode('utf-8')
+                
+                # Get memory info (actual system-wide usage)
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                total_memory = mem_info.total / (1024**3)  # Convert to GB
+                used_memory = mem_info.used / (1024**3)
+                free_memory = mem_info.free / (1024**3)
+                
+                # Display GPU name
+                st.caption(f"**{gpu_name}**")
+                
+                # Memory metrics
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Used", f"{used_memory:.1f}GB")
+                with col2:
+                    st.metric("Total", f"{total_memory:.1f}GB")
+                
+                # Progress bar
+                usage_percent = used_memory / total_memory
+                st.progress(usage_percent)
+                st.caption(f"Free: {free_memory:.1f}GB ({(free_memory/total_memory*100):.1f}%)")
+                
+                # Shutdown NVML
+                pynvml.nvmlShutdown()
+                
+            except Exception as e:
+                # Fallback to torch info if NVML fails
+                gpu_name = torch.cuda.get_device_name(0)
+                total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                allocated = torch.cuda.memory_allocated(0) / (1024**3)
+                
+                st.caption(f"**{gpu_name}**")
+                st.metric("PyTorch", f"{allocated:.1f}GB")
+                st.caption(f"Total: {total_memory:.1f}GB")
+                st.caption("(PyTorch memory only)")
         else:
             st.caption("CPU mode")
         
         st.divider()
         
-        # API Configuration - compact
-        with st.expander("⚙️ API"):
-            api_key = st.text_input(
-                "API Key",
-                type="password",
-                value=st.session_state.get("openai_api_key", ""),
-                label_visibility="visible"
-            )
-            if api_key:
-                st.session_state["openai_api_key"] = api_key
-                st.caption("✅ Saved")
-        
-        st.divider()
-        
-        # Model info - very compact
-        with st.expander("🤖 Models"):
-            st.caption("**Embed:**")
-            st.caption("llama-3.2-nv-embedqa")
-            st.caption("**Rerank:**")
-            st.caption("llama-3.2-nv-rerankqa")
-            st.caption("**LLM:**")
-            st.caption(os.getenv("OPENAI_MODEL", "gpt-4"))
+        # Model info
+        st.markdown("🤖 Models")
+        st.caption("**Embed:**")
+        st.caption("llama-3.2-nv-embedqa")
+        st.caption("**Rerank:**")
+        st.caption("llama-3.2-nv-rerankqa")
+        st.caption("**LLM:**")
+        st.caption(os.getenv("OPENAI_MODEL", "gpt-4"))
     
     # ============= MAIN CONTENT: Query Interface =============
     with main_col:
@@ -890,12 +1000,53 @@ def main():
             elif not st.session_state.get("openai_api_key") and not os.getenv("OPENAI_API_KEY"):
                 st.error("🔑 Please configure your OpenAI API key in the right panel")
             else:
-                # Show process in real-time with status updates
-                run_rag_chain_streaming(query)
+                # Pass the configuration parameters to the RAG chain
+                run_rag_chain_with_details(
+                    query=query,
+                    enable_thinking=enable_thinking,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p
+                )
     # Sidebar Footer
     st.sidebar.markdown("---")
     st.sidebar.caption("IT Knowledge Base RAG System")
     st.sidebar.caption("Powered by Oracle 23AI & NVIDIA RAG Models")                
+
+
+def display_answer_with_thinking(response_text, thinking_enabled=False):
+    """Parse and display the response with thinking section if present.
+    
+    Args:
+        response_text (str): The raw response from the LLM
+        thinking_enabled (bool): Whether thinking was enabled
+    """
+    # Check if there's a thinking section
+    if "</think>" in response_text and thinking_enabled:
+        # Split at the closing tag
+        parts = response_text.split("</think>", 1)
+        thinking_part = parts[0]
+        answer_part = parts[1].strip() if len(parts) > 1 else ""
+        
+        # Remove opening <think> tag if present
+        if "<think>" in thinking_part:
+            thinking_part = thinking_part.split("<think>", 1)[1]
+        
+        # Display thinking
+        with st.container():
+            st.info("💭 **Thinking Process**")
+            st.write(thinking_part.strip())
+        
+        st.divider()
+        
+        # Display the actual answer
+        if answer_part:
+            st.success("📝 **Answer**")
+            st.markdown(answer_part)
+    else:
+        # No thinking section or thinking disabled, just display the answer
+        st.success("📝 **Answer**")
+        st.markdown(response_text)
 
 
 def run_rag_chain_streaming(query):
@@ -1009,40 +1160,6 @@ ANSWER:"""
     with answer_container:
         st.divider()
         display_answer_with_thinking(answer)
-
-
-def display_answer_with_thinking(response_text):
-    """Parse and display the response with thinking section shown separately.
-    
-    Args:
-        response_text (str): The raw response from the LLM
-    """
-    # Check if there's a thinking section
-    if "</think>" in response_text:
-        # Split at the closing tag
-        parts = response_text.split("</think>", 1)
-        thinking_part = parts[0]
-        answer_part = parts[1].strip() if len(parts) > 1 else ""
-        
-        # Remove opening <think> tag if present
-        if "<think>" in thinking_part:
-            thinking_part = thinking_part.split("<think>", 1)[1]
-        
-        # Display thinking in an info box
-        st.info("💭 **Thinking Process**")
-        st.write(thinking_part.strip())
-        
-        st.divider()
-        
-        # Display the actual answer
-        if answer_part:
-            st.success("📝 **Answer**")
-            st.markdown(answer_part)
-    else:
-        # No thinking section, just display the answer
-        st.success("📝 **Answer**")
-        st.markdown(response_text)
-
 
              
 if __name__ == "__main__":
