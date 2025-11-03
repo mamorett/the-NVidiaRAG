@@ -1,0 +1,6 @@
+transformers==4.47.1
+streamlit
+openai
+sentence-transformers
+oracledb
+pypdf
