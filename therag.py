@@ -16,7 +16,7 @@ import time
 # Import your RAG class (assuming it's in a file called rag_class.py)
 from nvidiaRAGclass import RAGEmbeddingReranker
 # Load environment variables
-load_dotenv()
+load_dotenv(override=True)
 
 # Initialize RAG model
 @st.cache_resource
@@ -691,7 +691,7 @@ def run_rag_chain_with_details(query, enable_thinking=False,
         with st.status("💭 Generating answer...", expanded=True) as status3:
             try:
                 client = OpenAI(
-                    api_key=st.session_state.get("openai_api_key") or os.getenv("OPENAI_API_KEY"),
+                    api_key=os.getenv("OPENAI_API_KEY"),
                     base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
                 )
                 
@@ -997,8 +997,6 @@ def main():
         if submit_button:
             if not query:
                 st.warning("⚠️ Please enter a question")
-            elif not st.session_state.get("openai_api_key") and not os.getenv("OPENAI_API_KEY"):
-                st.error("🔑 Please configure your OpenAI API key in the right panel")
             else:
                 # Pass the configuration parameters to the RAG chain
                 run_rag_chain_with_details(
