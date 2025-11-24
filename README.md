@@ -17,6 +17,7 @@ This project provides an end-to-end solution for building a powerful question-an
 - **Document Management:** Easily upload PDF documents, which are automatically processed, chunked, and stored in the vector database.
 - **Detailed Process Insights:** The Streamlit interface provides a detailed view of the RAG process, including the retrieved documents, their similarity scores, and the reranked results.
 - **Optimized for Performance:** The application is optimized for performance, with features like batch processing and GPU memory management.
+- **Observability:** Integrated with Langfuse for detailed tracing and monitoring of the RAG pipeline, from embedding and reranking to the final generation step.
 
 ## How it Works
 
@@ -33,6 +34,17 @@ The NVidiaRAG system follows a two-stage process to answer questions:
 
 This two-stage process ensures that the generated answers are not only relevant but also accurate and grounded in the information contained in the knowledge base.
 
+## Observability with Langfuse
+
+This project uses [Langfuse](https://langfuse.com/) for tracing and observability. Langfuse allows you to monitor the performance of the RAG pipeline, track costs, and debug issues by providing a detailed view of each step in the process.
+
+- **Traceability:** Every query is tracked as a "trace," which includes all the steps from embedding the query to generating the final answer.
+- **Spans:** Each major operation (embedding, reranking, retrieval, LLM call) is tracked as a "span" within a trace, allowing you to see the duration and metadata of each step.
+- **Cost Tracking:** The Langfuse OpenAI wrapper automatically tracks token usage and costs for each LLM call.
+- **Metadata:** Additional metadata, such as model names, similarity scores, and reranking results, is logged to provide deeper insights into the process.
+
+To use Langfuse, you will need to set up the environment variables listed in the "Setup and Installation" section.
+
 ## Tech Stack
 
 - **Backend:** Python
@@ -46,6 +58,7 @@ This two-stage process ensures that the generated answers are not only relevant 
 - **Frontend:** `Streamlit`
 - **Database:** `Oracle Autonomous Database (23ai)`
 - **Document Processing:** `PyPDFLoader`, `LangChain`
+- **Observability:** `Langfuse`
 
 ## Setup and Installation
 
@@ -70,12 +83,20 @@ This two-stage process ensures that the generated answers are not only relevant 
     - Create a `.env` file in the root of the project.
     - Add the following environment variables to the `.env` file:
       ```
+      # Oracle Database
       ORACLE_USER="your_oracle_username"
       ORACLE_PASSWORD="your_oracle_password"
       ORACLE_DSN="your_oracle_dsn"
+
+      # OpenAI
       OPENAI_API_KEY="your_openai_api_key"
       OPENAI_BASE_URL="your_openai_base_url" # Optional
       OPENAI_MODEL="your_openai_model" # Optional
+
+      # Langfuse
+      LANGFUSE_SECRET_KEY="your_langfuse_secret_key"
+      LANGFUSE_PUBLIC_KEY="your_langfuse_public_key"
+      LANGFUSE_HOST="https://cloud.langfuse.com" # Or your self-hosted instance
       ```
 
 ## Usage
