@@ -32,6 +32,38 @@ def load_rag_model():
 
 rag_model = load_rag_model()
 
+# --- WRAPPER PER IL MONITORAGGIO ---
+# Usiamo questi wrapper per isolare il tracciamento dalla logica DB
+
+@observe(name="NVIDIA-Embedding", as_type="span")
+def generate_embedding_safe(text_list):
+    """Genera embedding tracciando tempi e utilizzo GPU"""
+    # Eseguiamo l'embedding
+    with torch.cuda.amp.autocast():
+        embeddings = rag_model.encode_queries(text_list)
+    
+    # Aggiungiamo info extra a Langfuse (opzionale)
+    langfuse_context.update_current_observation(
+        model="llama-3.2-nv-embedqa",
+        usage={"input": len(text_list), "unit": "queries"}
+    )
+    return embeddings
+
+@observe(name="NVIDIA-Rerank", as_type="span")
+def rerank_documents_safe(query, doc_contents):
+    """Esegue il reranking tracciando il punteggio"""
+    with torch.no_grad():
+        rerank_results = rag_model.rerank([query], doc_contents, return_sorted=True)
+    
+    # Logghiamo i top score per analisi
+    top_scores = [score for _, score in rerank_results[:3]]
+    langfuse_context.update_current_observation(
+        model="llama-3.2-nv-rerankqa",
+        metadata={"top_scores": top_scores}
+    )
+    return rerank_results
+# -----------------------------------
+
 def get_optimal_batch_size(num_chunks, available_memory_gb=10):
     """Calculate optimal batch size based on available GPU memory.
     
@@ -217,12 +249,14 @@ def retrieve_similar_documents(query, top_k=10):
     if not conn: return []
     
     try:
-        with torch.cuda.amp.autocast():
-            query_embedding = rag_model.encode_queries([query])
+        # --- MODIFICA: Usiamo il wrapper sicuro invece della chiamata diretta ---
+        # Vecchio codice: query_embedding = rag_model.encode_queries([query])
+        query_embedding = generate_embedding_safe([query])
+        # ----------------------------------------------------------------------
         
+        # Conversione in Numpy (fuori dal monitoraggio per sicurezza)
         query_embedding_np = query_embedding.cpu().numpy()[0].astype(np.float32)
         query_array = array.array('f', query_embedding_np)
-        
         del query_embedding, query_embedding_np
         
         cursor = conn.cursor()
@@ -249,16 +283,18 @@ def retrieve_similar_documents(query, top_k=10):
         cursor.close()
         conn.close()
         
-        try:
-            langfuse_context.update_current_observation(
-                output=[{"content": r[0][:50], "score": r[2]} for r in results]
-            )
-        except: pass
+        # Aggiorna il contesto con i risultati trovati
+        langfuse_context.update_current_observation(
+            output=[{"content": r[0][:50], "score": r[2]} for r in results]
+        )
         
         return results
         
     except Exception as e:
         st.error(f"Failed to retrieve documents: {e}")
+        # IMPORTANTE: Stampiamo l'errore reale in console per debug
+        import traceback
+        print(traceback.format_exc()) 
         if conn: conn.close()
         return []
 
@@ -667,10 +703,18 @@ def run_rag_chain_with_details(query, enable_thinking=False,
         # Extract content for reranking
         doc_contents = [doc[0] for doc in retrieved_docs]
         
-        # Step 2: Rerank documents
+        # Step 2: Rerank documents        
         with st.status("🎯 Step 2: Reranking documents...", expanded=False) as status2:
-            with torch.no_grad():
+            
+            # --- MODIFICA: Usiamo il wrapper sicuro per il Reranking ---
+            # Vecchio codice: rerank_results = rag_model.rerank(...)
+            try:
+                rerank_results = rerank_documents_safe(query, doc_contents)
+            except Exception as e:
+                st.error(f"Reranking monitor error: {e}")
+                # Fallback: se il wrapper fallisce, chiamiamo il modello direttamente
                 rerank_results = rag_model.rerank([query], doc_contents, return_sorted=True)
+            # -----------------------------------------------------------
             
             top_reranked = rerank_results[:5]
             st.write(f"Reranked to top {len(top_reranked)} most relevant")
