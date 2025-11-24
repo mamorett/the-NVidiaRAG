@@ -4,7 +4,13 @@ from dotenv import load_dotenv
 import oracledb
 import numpy as np
 import torch
-from openai import OpenAI
+import uuid
+# from openai import OpenAI
+# --- LANGFUSE INTEGRATION (STANDARD) ---
+from langfuse.decorators import observe, langfuse_context
+from langfuse.openai import OpenAI # Wrapper ufficiale che traccia token/costi in automatico
+# ---------------------------------------
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters.sentence_transformers import SentenceTransformersTokenTextSplitter
 import json
@@ -196,6 +202,7 @@ def add_documents_to_oracle_batch(chunks_batch, embeddings_batch):
                 pass
         return False
 
+@observe(as_type="generation")
 def retrieve_similar_documents(query, top_k=10):
     """Retrieve documents similar to the query using vector similarity search.
     
@@ -207,23 +214,18 @@ def retrieve_similar_documents(query, top_k=10):
         list: List of tuples (content, metadata, similarity_score)
     """
     conn = get_oracle_connection()
-    if not conn:
-        return []
+    if not conn: return []
     
     try:
-        # Generate query embedding
-        with torch.cuda.amp.autocast():  # Use automatic mixed precision
+        with torch.cuda.amp.autocast():
             query_embedding = rag_model.encode_queries([query])
         
         query_embedding_np = query_embedding.cpu().numpy()[0].astype(np.float32)
         query_array = array.array('f', query_embedding_np)
         
-        # Clear references
         del query_embedding, query_embedding_np
         
         cursor = conn.cursor()
-        
-        # Oracle 23AI vector similarity search
         search_sql = """
         SELECT content, metadata, 
                VECTOR_DISTANCE(embedding, :query_vec, COSINE) as distance
@@ -231,36 +233,33 @@ def retrieve_similar_documents(query, top_k=10):
         ORDER BY distance
         FETCH FIRST :top_k ROWS ONLY
         """
-        
         cursor.execute(search_sql, {'query_vec': query_array, 'top_k': top_k})
         
         results = []
         for row in cursor:
             content, metadata_str, distance = row
-            
-            # Handle CLOB content
-            if hasattr(content, 'read'):
-                content = content.read()
-            
-            # Convert distance to similarity
+            if hasattr(content, 'read'): content = content.read()
             similarity = 1.0 - float(distance)
-            
-            # Parse metadata JSON
             try:
                 metadata = json.loads(metadata_str) if metadata_str else {}
             except:
                 metadata = {}
-            
             results.append((content, metadata, similarity))
         
         cursor.close()
         conn.close()
+        
+        try:
+            langfuse_context.update_current_observation(
+                output=[{"content": r[0][:50], "score": r[2]} for r in results]
+            )
+        except: pass
+        
         return results
         
     except Exception as e:
         st.error(f"Failed to retrieve documents: {e}")
-        if conn:
-            conn.close()
+        if conn: conn.close()
         return []
 
 def get_document_count():
@@ -616,7 +615,7 @@ def add_to_db(uploaded_file):  # Single file, not list
         # Cleanup
         gc.collect()
 
-
+@observe()
 def run_rag_chain_with_details(query, enable_thinking=False, 
                                 max_tokens=32000, temperature=0.3, top_p=0.95):
     """Process a query using RAG and return detailed information.
@@ -631,6 +630,13 @@ def run_rag_chain_with_details(query, enable_thinking=False,
     Returns:
         tuple: (answer, retrieval_info, rerank_info)
     """
+
+    if "session_id" in st.session_state:
+        langfuse_context.update_current_trace(
+            session_id=st.session_state.session_id,
+            user_id="streamlit-user" # O un ID utente reale se hai il login
+        )
+
     # Create tabs for different views
     result_tab, process_tab = st.tabs(["📝 Answer", "🔍 Process Details"])
     
@@ -776,6 +782,10 @@ def main():
         initial_sidebar_state="expanded"
     )
     
+    # --- LANGFUSE: Inizializza Session State ---
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
+
     # Main header
     st.title("🤖 IT Knowledge Base")
     st.caption("Powered by NVIDIA RAG & AI Reranking")
