@@ -6,7 +6,7 @@
 
 The NVidiaRAG is a sophisticated Retrieval-Augmented Generation (RAG) system designed to answer questions based on a private knowledge base of documents. It leverages state-of-the-art NVIDIA language models for generating embeddings and reranking search results, ensuring high accuracy and relevance. The entire system is wrapped in a user-friendly web interface built with Streamlit, and it uses an Oracle Autonomous Database (23ai) for efficient vector storage and retrieval.
 
-![image](https://github.com/mamorett/the-NVidiaRAG/infograph.png)
+![image](https://github.com/mamorett/the-NVidiaRAG/blob/main/infograph.png)
 
 This project provides an end-to-end solution for building a powerful question-answering system that can be used for a variety of applications, such as customer support, internal knowledge management, and research.
 
